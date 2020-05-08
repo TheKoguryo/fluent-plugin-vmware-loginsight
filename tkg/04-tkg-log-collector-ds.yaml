@@ -1,0 +1,148 @@
+# Fluentd plugin for VMware Log Insight
+# 
+# Copyright 2018 VMware, Inc. All Rights Reserved. 
+# 
+# This product is licensed to you under the MIT license (the "License").  You may not use this product except in compliance with the MIT License.  
+# 
+# This product may include a number of subcomponents with separate copyright notices and license terms. Your use of these subcomponents is subject to the terms and conditions of the subcomponent's license, as noted in the LICENSE file. 
+# 
+# SPDX-License-Identifier: MIT
+
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: tanzu-system-logging
+data:
+  fluent.conf: |
+    <source>
+      @id in_tail_container_logs
+      @type tail
+      path /var/log/containers/*.log
+      pos_file /var/log/fluentd-containers.log.pos
+      tag raw.kubernetes.*
+      read_from_head true
+      <parse>
+        @type multi_format
+        <pattern>
+          format json
+          time_key time
+          time_format %Y-%m-%dT%H:%M:%S.%NZ
+        </pattern>
+        <pattern>
+          format /^(?<time>.+) (?<stream>stdout|stderr) [^ ]* (?<log>.*)$/
+          time_format %Y-%m-%dT%H:%M:%S.%N%:z
+        </pattern>
+      </parse>
+    </source>
+
+    # Detect exceptions in the log output and forward them as one log entry.
+    <match raw.kubernetes.**>
+      @id raw.kubernetes
+      @type detect_exceptions
+      remove_tag_prefix raw
+      message log
+      stream stream
+      multiline_flush_interval 5
+      max_bytes 500000
+      max_lines 1000
+    </match>
+     
+    # Concatenate multi-line logs
+    <filter **>
+      @type concat
+      key message
+      multiline_end_regexp /\n$/
+      separator ""
+    </filter>
+     
+    # Enriches records with Kubernetes metadata
+    <filter kubernetes.**>
+      @type kubernetes_metadata
+      watch false
+    </filter>
+
+    <match **>
+      @type copy
+      <store>
+        @type vmware_loginsight
+        scheme https
+        ssl_verify false
+        # Loginsight host: One may use IP address or cname
+        # host X.X.X.X
+        host loginsight.haas-239.pez.pivotal.io
+        port 9543
+        path api/v1/events/ingest
+        agent_id XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+        http_method post
+        #http_conn_debug true
+        serializer json
+        rate_limit_msec 0
+        raise_on_error false
+        include_tag_key true
+        tag_key tag
+      </store>
+      # If we want to debug and send logs to stdout as well
+      # <store>
+      #   @type stdout
+      # </store>
+    </match>
+
+---
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: "log-collector"
+  namespace: "tanzu-system-logging"
+  labels:
+    app: "log-collector"
+    version: v1
+spec:
+  selector:
+    matchLabels:
+      name: log-collector 
+  template:
+    metadata:
+      labels:
+        name: "log-collector"
+        app: "log-collector"
+        version: v1
+    spec:
+      containers:
+        - name: "log-collector"
+          image: "thekoguryo/log-insight-fluentd:1.0.3"
+          command: ["fluentd", "-c", "/fluentd/etc/fluent.conf", "-p", "/fluentd/plugins"]
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - name: runlogjournal
+              mountPath: /run/log/journal
+            - name: fluentdconfig
+              mountPath: /fluentd/etc
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: runlogjournal
+          hostPath:
+            path: /run/log/journal
+        - name: fluentdconfig
+          configMap:
+            name: "fluentd-config"
+      serviceAccountName: fluent-bit
